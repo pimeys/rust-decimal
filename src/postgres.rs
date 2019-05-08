@@ -4,7 +4,7 @@ use num::Zero;
 
 use crate::Decimal;
 
-use postgres::{to_sql_checked, types::*};
+use postgres::types::*;
 
 #[cfg(not(feature = "const_fn"))]
 use lazy_static::lazy_static;
@@ -83,7 +83,7 @@ impl error::Error for InvalidDecimal {
     }
 }
 
-impl FromSql for Decimal {
+impl<'a> FromSql<'a> for Decimal {
     // Decimals are represented as follows:
     // Header:
     //  u16 numGroups
@@ -183,8 +183,8 @@ impl FromSql for Decimal {
     }
 
     fn accepts(ty: &Type) -> bool {
-        match *ty {
-            NUMERIC => true,
+        match ty {
+            &Type::NUMERIC => true,
             _ => false,
         }
     }
@@ -247,13 +247,66 @@ impl ToSql for Decimal {
     }
 
     fn accepts(ty: &Type) -> bool {
-        match *ty {
-            NUMERIC => true,
+        match ty {
+            &Type::NUMERIC => true,
             _ => false,
         }
     }
 
-    to_sql_checked!();
+    fn to_sql_checked(&self, _: &Type, out: &mut Vec<u8>) -> Result<IsNull, Box<error::Error + 'static + Sync + Send>> {
+        // If it's zero we can short cut with a u64
+        if self.is_zero() {
+            out.write_u64::<BigEndian>(0)?;
+            return Ok(IsNull::No);
+        }
+        let sign = if self.is_sign_negative() { 0x4000 } else { 0x0000 };
+        let scale = self.scale() as u16;
+
+        let groups_diff = scale & 0x3; // groups_diff = scale % 4
+        let mut fractional_groups_count = (scale >> 2) as isize; // fractional_groups_count = scale / 4
+        fractional_groups_count += if groups_diff > 0 { 1 } else { 0 };
+
+        let mut mantissa = self.mantissa_array4();
+
+        if groups_diff > 0 {
+            let remainder = 4 - groups_diff;
+            let power = 10u32.pow(remainder as u32);
+            mul_by_u32(&mut mantissa, power);
+        }
+
+        // array to store max mantissa of Decimal in Postgres decimal format
+        const MAX_GROUP_COUNT: usize = 8;
+        let mut groups = [0u16; MAX_GROUP_COUNT];
+
+        let mut num_groups = 0usize;
+        while !is_all_zero(&mantissa) {
+            let group_digits = div_by_u32(&mut mantissa, 10000) as u16;
+            groups[num_groups] = group_digits;
+            num_groups += 1;
+        }
+
+        let whole_portion_len = num_groups as isize - fractional_groups_count;
+        let weight = if whole_portion_len < 0 {
+            -(fractional_groups_count as i16)
+        } else {
+            whole_portion_len as i16 - 1
+        };
+
+        // Number of groups
+        out.write_u16::<BigEndian>(num_groups as u16)?;
+        // Weight of first group
+        out.write_i16::<BigEndian>(weight)?;
+        // Sign
+        out.write_u16::<BigEndian>(sign)?;
+        // DScale
+        out.write_u16::<BigEndian>(scale)?;
+        // Now process the number
+        for group in groups[0..num_groups].iter().rev() {
+            out.write_u16::<BigEndian>(*group)?;
+        }
+
+        Ok(IsNull::No)
+    }
 }
 
 #[cfg(test)]
@@ -380,9 +433,7 @@ mod test {
 
     #[test]
     fn numeric_overflow() {
-        let tests = [
-            (4, 4, "3950.1234"),
-        ];
+        let tests = [(4, 4, "3950.1234")];
         let conn = match Connection::connect("postgres://postgres@localhost", TlsMode::None) {
             Ok(x) => x,
             Err(err) => panic!("{:#?}", err),
@@ -393,10 +444,13 @@ mod test {
                 Err(err) => panic!("{:#?}", err),
             };
             match stmt.query(&[]) {
-                Ok(_) => panic!("Expected numeric overflow for {}::NUMERIC({}, {})", sent, precision, scale),
+                Ok(_) => panic!(
+                    "Expected numeric overflow for {}::NUMERIC({}, {})",
+                    sent, precision, scale
+                ),
                 Err(err) => {
                     assert_eq!("22003", err.code().unwrap().code(), "Unexpected error code");
-                },
+                }
             };
         }
     }
