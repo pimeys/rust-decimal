@@ -3,6 +3,7 @@
 use float_cmp::*;
 use num::{ToPrimitive, Zero};
 use rust_decimal::{Decimal, RoundingStrategy};
+use bytes::BytesMut;
 
 use std::{
     cmp::{Ordering, Ordering::*},
@@ -1362,9 +1363,9 @@ fn to_from_sql() {
 
     for test in tests {
         let input = Decimal::from_str(test).unwrap();
-        let mut vec = Vec::<u8>::new();
-        input.to_sql(&t, &mut vec).unwrap();
-        let output = Decimal::from_sql(&t, &vec).unwrap();
+        let mut bytes = BytesMut::new();
+        input.to_sql(&t, &mut bytes).unwrap();
+        let output = Decimal::from_sql(&t, &bytes).unwrap();
 
         assert_eq!(input, output);
     }
